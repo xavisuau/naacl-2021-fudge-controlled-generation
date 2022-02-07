@@ -7,6 +7,7 @@ from argparse import ArgumentParser
 from collections import defaultdict
 import string
 import csv
+import pandas as pd
 
 from tqdm import tqdm
 import numpy as np
@@ -25,7 +26,7 @@ from constants import *
 def main(args):
     with open(args.dataset_info, 'rb') as rf:
         dataset_info = pickle.load(rf)
-    gpt_tokenizer = AutoTokenizer.from_pretrained(args.model_string)
+    gpt_tokenizer = GPT2Tokenizer.from_pretrained(args.model_string)
     gpt_tokenizer.add_special_tokens({'pad_token': PAD_TOKEN})
     gpt_pad_id = gpt_tokenizer.encode(PAD_TOKEN)[0]
     gpt_model = AutoModelWithLMHead.from_pretrained(args.model_string).to(args.device)
@@ -42,7 +43,7 @@ def main(args):
                 .format(args.ckpt, checkpoint['epoch']))
         print('num params', num_params(conditioning_model))
 
-    input_texts, conditions, categories = [], [], []
+    input_texts, conditions, categories, lambdas = [], [], [], []
 
     if args.condition_file is not None:
         with open(args.condition_file, 'r') as rf:
@@ -70,15 +71,17 @@ def main(args):
                             if args.verbose:
                                 print('word not found:', word)
                 condition_wordlists.append((' '.join(words), fname.split('.')[0]))
-        for p in prefixes:
-            for c, category in condition_wordlists:
-                input_texts.append(p)
-                conditions.append(c)
-                categories.append(category)
+        for lambd in args.condition_lambda:
+            for p in prefixes:
+                for c, category in condition_wordlists:
+                    input_texts.append(p)
+                    conditions.append(c)
+                    categories.append(category)
+                    lambdas.append(lambd)
     
     all_cr = []
     pair_num = 0
-    for input_text, condition_words, category in tqdm(zip(input_texts, conditions, categories), total=len(conditions)):
+    for input_text, condition_words, category, lambd in tqdm(zip(input_texts, conditions, categories, lambdas), total=len(conditions)):
         predict_function = predict
         condition_results = []
         for i in range(0, args.sample_size, args.max_sample_batch):
@@ -92,18 +95,36 @@ def main(args):
                             args.precondition_topk,
                             args.topk, 
                             args.length_cutoff,
-                            condition_lambda=args.condition_lambda,
+                            condition_lambda=lambd,
                             device=args.device)
-        all_cr.append((input_text, category, condition_results))
+        all_cr.append((input_text, category, condition_results, lambd))
         pair_num += 1
         if args.max_pairs > 0 and pair_num >= args.max_pairs:
             break
-    with open(args.log_file, 'w') as wf:
-        writer = csv.DictWriter(wf, fieldnames=['category', 'input_text', 'generation'])
-        writer.writeheader()
-        for cr_group in all_cr:
-            for cr in cr_group[2]:
-                writer.writerow({'category': cr_group[1], 'input_text': cr_group[0], 'generation': cr})
+    # with open(args.log_file, 'w') as wf:
+    #     writer = csv.DictWriter(wf, fieldnames=['concept', 'context', 'sentence'])
+    #     writer.writeheader()
+    #     for cr_group in all_cr:
+    #         for sentence in cr_group[2]:
+    #             writer.writerow({'concept': cr_group[1], 'context': cr_group[0], 'sentence': sentence})
+
+    all_runs = []
+    for cr_group in all_cr:
+        context, concept, condition_results, lambd = cr_group
+        this_runs = [
+            {'concept': cr_group[1],
+             'context': cr_group[0],
+             'sentence': sentence,
+             'fudge_lambda': lambd,
+             } for sentence in cr_group[2]
+        ]
+        all_runs += this_runs
+
+    df_all = pd.DataFrame(data=all_runs)
+    for group, df_group in df_all.groupby(['concept', 'context']):
+        print(df_group)
+        concept, context = group
+        df_group.to_csv(args.log_file + f'/forced_sentences_{concept}-1_18_00___{context.replace(" ", "_")}.csv')
 
 
 if __name__=='__main__':
@@ -124,11 +145,11 @@ if __name__=='__main__':
 
     parser.add_argument('--precondition_topk', type=int, default=200, help='consider top k outputs from gpt at each step before conditioning and re-pruning')
     parser.add_argument('--topk', type=int, default=10, help='consider top k outputs from gpt at each step')
-    parser.add_argument('--condition_lambda', type=float, default=1.0, help='lambda weight on conditioning model')
+    parser.add_argument('--condition_lambda', type=float, default=[1.0, ], nargs='+', help='lambda weight on conditioning model')
     parser.add_argument('--length_cutoff', type=int, default=80, help='max length')
 
     parser.add_argument('--seed', type=int, default=1, help='random seed')
-    parser.add_argument('--device', type=str, default='cuda', choices=['cpu', 'cuda'])
+    parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--debug', action='store_true', default=False)
     parser.add_argument('--verbose', action='store_true', default=False)
 
